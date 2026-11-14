@@ -1,0 +1,151 @@
+name: Optimize uploaded sprites
+
+'on':
+  push:
+    branches:
+      - upload
+    paths:
+      - 'input/**'
+      - '!input/README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: heroic-packer-results
+  cancel-in-progress: false
+
+jobs:
+  optimize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out uploaded files
+        uses: actions/checkout@v4
+        with:
+          ref: upload
+          path: upload-branch
+
+      - name: Check out Heroic Packer source
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: project
+
+      - name: Check out results branch
+        uses: actions/checkout@v4
+        with:
+          ref: results
+          path: results-branch
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: yarn
+          cache-dependency-path: project/yarn.lock
+
+      - name: Repair source filenames if needed
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in \
+            "src/api/FunkinPackerApi" \
+            "src/api/packers/Packer" \
+            "src/api/packers/OptimalPacker"
+          do
+            if [ -f "${file}.txt" ] && [ ! -f "${file}.ts" ]; then
+              mv "${file}.txt" "${file}.ts"
+            fi
+          done
+
+      - name: Install Heroic Packer dependencies
+        working-directory: project
+        run: yarn install --frozen-lockfile
+
+      - name: Build Heroic Packer web app
+        working-directory: project
+        run: yarn build
+
+      - name: Install Playwright
+        working-directory: project
+        run: npm install --no-save --package-lock=false playwright@latest
+
+      - name: Install Chromium
+        working-directory: project
+        run: npx playwright install --with-deps chromium
+
+      - name: Start Heroic Packer
+        working-directory: project
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m http.server 4000 --bind 127.0.0.1 --directory dist > /tmp/heroic-packer-http.log 2>&1 &
+          echo $! > /tmp/heroic-packer-http.pid
+
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:4000/ > /dev/null; then
+              echo "Heroic Packer is ready."
+              exit 0
+            fi
+            sleep 2
+          done
+
+          cat /tmp/heroic-packer-http.log
+          exit 1
+
+      - name: Run Heroic Packer optimizer
+        working-directory: project
+        env:
+          INPUT_DIR: ${{ github.workspace }}/upload-branch/input
+          OUTPUT_DIR: ${{ runner.temp }}/heroic-packer-output
+          APP_URL: http://127.0.0.1:4000
+        run: node scripts/optimizer.mjs
+
+      - name: Append optimized files to results branch
+        shell: bash
+        env:
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          OUTPUT_FILES="${RUNNER_TEMP}/heroic-packer-output/files"
+          SUMMARY="${RUNNER_TEMP}/heroic-packer-output/summary.json"
+
+          test -d "$OUTPUT_FILES"
+          test -f "$SUMMARY"
+
+          RUN_FOLDER="optimized/${RUN_ID}-${RUN_ATTEMPT}"
+          DEST="results-branch/${RUN_FOLDER}"
+
+          mkdir -p "$DEST"
+          cp -a "$OUTPUT_FILES/." "$DEST/"
+          cp "$SUMMARY" "$DEST/automation-summary.json"
+
+          cat > "$DEST/run-info.txt" <<EOF
+          Heroic Packer automated optimization
+          GitHub run: ${RUN_ID}
+          Run attempt: ${RUN_ATTEMPT}
+          Source commit: ${SOURCE_COMMIT}
+          Input branch: upload
+          Output branch: results
+          EOF
+
+          cd results-branch
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$RUN_FOLDER"
+
+          if git diff --cached --quiet; then
+            echo "No output changes to commit."
+          else
+            git commit -m "Optimize sprites (run ${RUN_ID}-${RUN_ATTEMPT})"
+            git push origin HEAD:results
+          fi
+          
